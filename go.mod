@@ -1,4 +1,4 @@
-module github.com/nym/sentinel
+module github.com/nym/traceguard
 
 go 1.26.4
 

@@ -18,6 +18,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
@@ -60,6 +61,8 @@ func main() {
 func run() error {
 	rulesPath := flag.String("rules", "rules.yaml", "path to the YAML rule-config file")
 	verbose := flag.Bool("verbose", false, "also print the raw telemetry stream (default: alerts only)")
+	webhook := flag.String("webhook", "", "if set, POST each alert as JSON to this URL (default: disabled)")
+	logFile := flag.String("log-file", "", "if set, also append all output to this file (default: stdout only)")
 	flag.Parse()
 
 	// Load and parse the rule config once, before any monitor starts. If this
@@ -68,6 +71,29 @@ func run() error {
 	ruleConfig, err := loadRules(*rulesPath)
 	if err != nil {
 		return err
+	}
+
+	// Optional webhook sender. When -webhook is unset, webhookCh stays nil and
+	// sendAlert below becomes a no-op, so the rest of the pipeline is unaware
+	// of whether a webhook is configured. The buffer absorbs short bursts; the
+	// sender drops (and logs) rather than block detection on network I/O.
+	var webhookCh chan Alert
+	if *webhook != "" {
+		webhookCh = make(chan Alert, 100)
+		startWebhookSender(*webhook, webhookCh)
+	}
+
+	// Output writer: stdout by default, mirrored to a log file when -log-file
+	// is set. Opening the file is fatal so a bad path surfaces at startup
+	// rather than silently dropping the log. The file is closed on return.
+	var w io.Writer = os.Stdout
+	if *logFile != "" {
+		f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			return fmt.Errorf("open log file %q: %w", *logFile, err)
+		}
+		defer f.Close()
+		w = io.MultiWriter(os.Stdout, f)
 	}
 
 	// eBPF maps and programs are charged against a per-process memory-lock
@@ -177,7 +203,7 @@ func run() error {
 		for ev := range out {
 			if *verbose {
 				if b, err := json.Marshal(&ev); err == nil {
-					fmt.Println(string(b))
+					fmt.Fprintln(w, string(b))
 				}
 			}
 			for _, a := range Evaluate(ev, ruleConfig) {
@@ -196,7 +222,10 @@ func run() error {
 					fmt.Fprintf(os.Stderr, "traceguard: encode alert: %v\n", err)
 					continue
 				}
-				fmt.Println(string(b))
+				fmt.Fprintln(w, string(b))
+				// Mirror the alert to the webhook sender. No-op when no webhook
+				// is configured (webhookCh is nil); never blocks the consumer.
+				sendAlert(webhookCh, *a)
 			}
 		}
 	}()

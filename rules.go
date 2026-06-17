@@ -60,13 +60,13 @@ type NetworkAnomalyRule struct {
 }
 
 type Alert struct {
-	Rule     string
-	Severity Severity
-	Message  string
-	PID      uint32
-	Comm     string
-	Filename string
-	Dst      string
+	Rule     string   `json:"rule"`
+	Severity Severity `json:"severity"`
+	Message  string   `json:"message"`
+	PID      uint32   `json:"pid"`
+	Comm     string   `json:"comm"`
+	Filename string   `json:"filename,omitempty"`
+	Dst      string   `json:"dst,omitempty"`
 }
 
 func contains(list []string, s string) bool {

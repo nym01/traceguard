@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"sync"
@@ -30,6 +31,7 @@ import (
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror -I/usr/include/x86_64-linux-gnu" -type event execmon bpf/execmon.bpf.c
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror -I/usr/include/x86_64-linux-gnu" -type event filemon bpf/filemon.bpf.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror -I/usr/include/x86_64-linux-gnu" -type event netmon bpf/netmon.bpf.c
 
 // execEvent is the user-facing JSON shape for one process-exec event. It is
 // decoded from the raw ring-buffer sample (via the bpf2go-generated
@@ -54,6 +56,19 @@ type fileEvent struct {
 	CgroupID  uint64 `json:"cgroup_id"`
 	Comm      string `json:"comm"`
 	Filename  string `json:"filename"`
+}
+
+// netEvent is the user-facing JSON shape for one outbound-connection event,
+// decoded from the bpf2go-generated netmonEvent. Dst is a human-readable
+// "a.b.c.d:port" rendering of the raw dst_ip bytes and (already host-order)
+// dst_port.
+type netEvent struct {
+	Type      string `json:"type"` // always "network"
+	Timestamp string `json:"timestamp"`
+	PID       uint32 `json:"pid"`
+	CgroupID  uint64 `json:"cgroup_id"`
+	Comm      string `json:"comm"`
+	Dst       string `json:"dst"`
 }
 
 func main() {
@@ -108,6 +123,25 @@ func run() error {
 	}
 	defer fileRD.Close()
 
+	// --- Step 3: network-connection monitor ---
+	var netObjs netmonObjects
+	if err := loadNetmonObjects(&netObjs, nil); err != nil {
+		return fmt.Errorf("load netmon objects: %w", err)
+	}
+	defer netObjs.Close()
+
+	netTP, err := link.Tracepoint("syscalls", "sys_enter_connect", netObjs.OnConnect, nil)
+	if err != nil {
+		return fmt.Errorf("attach connect tracepoint: %w", err)
+	}
+	defer netTP.Close()
+
+	netRD, err := ringbuf.NewReader(netObjs.Events)
+	if err != nil {
+		return fmt.Errorf("open net ring buffer reader: %w", err)
+	}
+	defer netRD.Close()
+
 	// Shared output channel: every reader marshals its event to JSON and sends
 	// the bytes here. A single printer goroutine writes them out, so two
 	// concurrent readers can't interleave a half-written line on stdout.
@@ -121,13 +155,14 @@ func run() error {
 		<-stop
 		execRD.Close()
 		fileRD.Close()
+		netRD.Close()
 	}()
 
 	// One reader goroutine per monitor; the WaitGroup lets us close the shared
 	// channel only once both have drained, so the printer flushes every
 	// buffered event before main() returns.
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 	go func() {
 		defer wg.Done()
 		readLoop(execRD, out, decodeExec)
@@ -135,6 +170,10 @@ func run() error {
 	go func() {
 		defer wg.Done()
 		readLoop(fileRD, out, decodeFile)
+	}()
+	go func() {
+		defer wg.Done()
+		readLoop(netRD, out, decodeNet)
 	}()
 
 	// Printer: the sole writer to stdout.
@@ -146,7 +185,7 @@ func run() error {
 		}
 	}()
 
-	fmt.Fprintln(os.Stderr, "traceguard: monitoring process execs and file access (Ctrl-C to stop)")
+	fmt.Fprintln(os.Stderr, "traceguard: monitoring process execs, file access, and network connections (Ctrl-C to stop)")
 
 	wg.Wait()    // both readers have exited
 	close(out)   // no more events; let the printer drain and stop
@@ -216,6 +255,27 @@ func decodeFile(sample []byte) ([]byte, error) {
 	b, err := json.Marshal(&ev)
 	if err != nil {
 		return nil, fmt.Errorf("encode file event: %w", err)
+	}
+	return b, nil
+}
+
+// decodeNet turns a raw netmon ring-buffer sample into a marshaled netEvent.
+func decodeNet(sample []byte) ([]byte, error) {
+	var raw netmonEvent
+	if err := binary.Read(bytes.NewReader(sample), binary.LittleEndian, &raw); err != nil {
+		return nil, fmt.Errorf("decode net sample: %w", err)
+	}
+	ev := netEvent{
+		Type:      "network",
+		Timestamp: time.Now().Format(time.RFC3339Nano),
+		PID:       raw.Pid,
+		CgroupID:  raw.CgroupId,
+		Comm:      goString(raw.Comm[:]),
+		Dst:       fmt.Sprintf("%s:%d", net.IP(raw.DstIp[:]).String(), raw.DstPort),
+	}
+	b, err := json.Marshal(&ev)
+	if err != nil {
+		return nil, fmt.Errorf("encode net event: %w", err)
 	}
 	return b, nil
 }

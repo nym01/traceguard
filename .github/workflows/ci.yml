@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  release:
+    types: [published]
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Match go.mod (go 1.26.4).
+          go-version: "1.26"
+
+      - name: Install eBPF build toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev
+
+      # Pure-Go logic only (rules engine + validate package). We do NOT
+      # load the eBPF programs or run the docker-based attack suite here:
+      # GitHub-hosted runners aren't guaranteed the right kernel/BTF or
+      # docker-in-docker. The live load was verified locally.
+      - name: Generate eBPF objects
+        run: go generate ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -v ./...
+
+      - name: Build
+        run: go build -o traceguard .
+
+  docker:
+    name: docker
+    needs: test
+    # Push images only from main or a release; PRs/forks still build via
+    # the test job without needing registry credentials.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ github.sha }}

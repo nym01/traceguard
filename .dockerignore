@@ -1,0 +1,9 @@
+# Keep the build context small and avoid shipping stale local
+# artifacts (mirrors .gitignore). The binary is always built fresh
+# inside the builder stage.
+.git
+*.log
+traceguard
+traceguard-validate
+validation.log
+perf*.log

@@ -3,10 +3,17 @@
 //
 // To keep the stream useful rather than overwhelming, we deliberately only
 // emit an event when the open() requests *write* access (any of the write-ish
-// flags below) OR the path lives under /etc/. Logging every read open() on a
-// busy system would bury the signal. Deciding which specific /etc/ paths are
-// actually sensitive (e.g. /etc/shadow vs /etc/foo) is the rule engine's job
-// in a later step — this monitor stays dumb on purpose.
+// flags below), OR the path lives under /etc/, OR the path carries a sensitive
+// credential marker (.ssh/, .aws/, .pem, id_rsa, id_ed25519). The first two
+// cover privesc writes and the classic /etc/ secrets; the marker check exists
+// because read-opens of credentials living *outside* /etc/ — SSH keys and
+// cloud creds in a home dir — would otherwise be dropped here before the rule
+// engine ever saw them (a real evasion the validation suite surfaced).
+//
+// This stays a *coarse* pre-filter: it forwards anything plausibly sensitive
+// and leaves the precise decision (which exact path/substring matters) to the
+// rule engine. Logging every read open() on a busy system would bury the
+// signal, so unmarked reads are still dropped in-kernel.
 //
 // We avoid libc's <fcntl.h> (it conflicts when targeting bpf) and hand-define
 // the O_* flag bits as plain macros instead.
@@ -56,6 +63,43 @@ struct {
 	__uint(max_entries, 256 * 1024);
 } events SEC(".maps");
 
+// has_sensitive_marker scans the path for any credential marker substring at
+// an arbitrary offset (e.g. /home/u/.ssh/id_rsa, /root/.aws/credentials,
+// server.pem). Every index is masked to [0,255] so the verifier can prove the
+// access is in-bounds, and the outer loop is bounded by a constant; the scan
+// stops early at the NUL terminator. This is a coarse prefix match — it only
+// needs to avoid dropping anything the rule engine would later match.
+static __always_inline int has_sensitive_marker(const __u8 *f)
+{
+	for (int i = 0; i < 248; i++) {
+		__u8 c0 = f[i & 0xff];
+		if (c0 == 0)
+			break;
+		__u8 c1 = f[(i + 1) & 0xff];
+		__u8 c2 = f[(i + 2) & 0xff];
+		__u8 c3 = f[(i + 3) & 0xff];
+		__u8 c4 = f[(i + 4) & 0xff];
+
+		// ".pem"
+		if (c0 == '.' && c1 == 'p' && c2 == 'e' && c3 == 'm')
+			return 1;
+		// ".ssh/"
+		if (c0 == '.' && c1 == 's' && c2 == 's' && c3 == 'h' && c4 == '/')
+			return 1;
+		// ".aws/"
+		if (c0 == '.' && c1 == 'a' && c2 == 'w' && c3 == 's' && c4 == '/')
+			return 1;
+		// "id_rsa"
+		if (c0 == 'i' && c1 == 'd' && c2 == '_' && c3 == 'r' && c4 == 's' &&
+		    f[(i + 5) & 0xff] == 'a')
+			return 1;
+		// "id_ed25519" — the "id_ed" prefix is specific enough to forward on.
+		if (c0 == 'i' && c1 == 'd' && c2 == '_' && c3 == 'e' && c4 == 'd')
+			return 1;
+	}
+	return 0;
+}
+
 SEC("tracepoint/syscalls/sys_enter_openat")
 int on_openat(struct trace_event_raw_sys_enter *ctx)
 {
@@ -74,12 +118,13 @@ int on_openat(struct trace_event_raw_sys_enter *ctx)
 	// openat's filename is a *userspace* pointer; use the _user variant.
 	bpf_probe_read_user_str(&e->filename, sizeof(e->filename), filename);
 
-	// Noise filter: keep writes (any path) and reads under /etc/, drop the rest.
+	// Noise filter: keep writes (any path), reads under /etc/, and reads of
+	// credential-marked paths; drop the rest.
 	int is_write = flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND);
 	int is_etc = e->filename[0] == '/' && e->filename[1] == 'e' &&
 		     e->filename[2] == 't' && e->filename[3] == 'c' &&
 		     e->filename[4] == '/';
-	if (!is_write && !is_etc) {
+	if (!is_write && !is_etc && !has_sensitive_marker(e->filename)) {
 		bpf_ringbuf_discard(e, 0);
 		return 0;
 	}

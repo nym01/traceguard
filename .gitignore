@@ -1,2 +1,6 @@
 traceguard
 traceguard.log
+traceguard-validate
+validation.log
+perf.log
+perf_steadystate.log

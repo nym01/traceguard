@@ -11,19 +11,19 @@ type Severity string
 // Event is the unified shape all three monitors (exec, file_access,
 // network) produce. Not every field is populated for every event type.
 type Event struct {
-	Type string // "exec" | "file_access" | "network"
-	PID  uint32
-	PPID uint32
-	Comm string
+	Type string `json:"type"` // "exec" | "file_access" | "network"
+	PID  uint32 `json:"pid"`
+	PPID uint32 `json:"ppid,omitempty"`
+	Comm string `json:"comm"`
 	// ParentComm is the parent process's command name. Only populated for
 	// exec events, captured in-kernel at the moment of the exec rather than
 	// looked up afterward via /proc — by lookup time the parent may already
 	// have exited, which would otherwise lose the name on fast-moving execs.
-	ParentComm string
-	Filename   string
-	Flags      uint32
-	DstIP      string
-	DstPort    uint16
+	ParentComm string `json:"parent_comm,omitempty"`
+	Filename   string `json:"filename,omitempty"`
+	Flags      uint32 `json:"flags,omitempty"`
+	DstIP      string `json:"dst_ip,omitempty"`
+	DstPort    uint16 `json:"dst_port,omitempty"`
 }
 
 type RuleConfig struct {

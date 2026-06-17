@@ -1,4 +1,4 @@
-module github.com/nym/traceguard
+module github.com/nym01/traceguard
 
 go 1.26.4
 

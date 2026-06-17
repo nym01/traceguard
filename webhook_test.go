@@ -26,7 +26,8 @@ func TestWebhookSender_SendsCorrectPayload(t *testing.T) {
 	defer srv.Close()
 
 	ch := make(chan Alert, 10)
-	startWebhookSender(srv.URL, ch)
+	var wg sync.WaitGroup
+	startWebhookSender(srv.URL, ch, &wg)
 
 	a := Alert{
 		Rule:     "sensitive-file-access",
@@ -79,4 +80,60 @@ func TestSendAlert_FullChannel_DropsWithoutBlocking(t *testing.T) {
 	case <-time.After(1 * time.Second):
 		t.Fatal("sendAlert blocked on a full channel instead of dropping")
 	}
+}
+
+func TestWebhookSender_ServerReturns500_LogsAndContinues(t *testing.T) {
+	// The server fails every request. The sender must log the unexpected
+	// status and keep draining — a second alert still has to reach the
+	// server, proving the goroutine didn't die or block on the first 500.
+	gotReq := make(chan struct{}, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		gotReq <- struct{}{}
+	}))
+	defer srv.Close()
+
+	ch := make(chan Alert, 10)
+	var wg sync.WaitGroup
+	startWebhookSender(srv.URL, ch, &wg)
+
+	sendAlert(ch, Alert{Rule: "first"})
+	sendAlert(ch, Alert{Rule: "second"})
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-gotReq:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("expected request %d to reach the server despite repeated 500s", i+1)
+		}
+	}
+}
+
+func TestWebhookSender_UnreachableURL_LogsAndContinues(t *testing.T) {
+	// Nothing listens on port 1, so every POST errors. The sender must log
+	// the error and keep draining rather than block or die: both buffered
+	// alerts should be consumed from the channel.
+	ch := make(chan Alert, 10)
+	var wg sync.WaitGroup
+	startWebhookSender("http://127.0.0.1:1", ch, &wg)
+
+	sendAlert(ch, Alert{Rule: "first"})
+	sendAlert(ch, Alert{Rule: "second"})
+
+	deadline := time.After(2 * time.Second)
+	for len(ch) > 0 {
+		select {
+		case <-deadline:
+			t.Fatalf("sender stopped draining on POST errors; %d alert(s) left in queue", len(ch))
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestWebhookSender_MarshalError(t *testing.T) {
+	// Skipped deliberately: Alert (and thus webhookPayload) contains only
+	// string/uint fields, which always marshal cleanly. There is no
+	// non-contrived way to force a json.Marshal error through this path, so
+	// rather than fake one we document that the branch is unreachable here.
+	t.Skip("webhookPayload always marshals cleanly; no realistic way to trigger the marshal-error branch")
 }

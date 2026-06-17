@@ -1,9 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ---- Build stage ----
-# go.mod declares `go 1.26.4`, so the builder must be >= 1.26 (the
-# task text mentions 1.22, but that predates the current go.mod and
-# would fail to build / trigger a toolchain auto-download).
+# go.mod declares `go 1.26.4`, so the builder must be >= 1.26.
 FROM golang:1.26-bookworm AS builder
 
 # Same toolchain used throughout local development: clang/llvm compile

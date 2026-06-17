@@ -14,7 +14,11 @@ type Event struct {
 	Type string `json:"type"` // "exec" | "file_access" | "network"
 	PID  uint32 `json:"pid"`
 	PPID uint32 `json:"ppid,omitempty"`
-	Comm string `json:"comm"`
+	// CgroupID is the cgroup the event fired in, captured in-kernel by all
+	// three monitors. It's the seed for the per-cgroup container lineage
+	// tracking listed as a v2 direction in the README.
+	CgroupID uint64 `json:"cgroup_id,omitempty"`
+	Comm     string `json:"comm"`
 	// ParentComm is the parent process's command name. Only populated for
 	// exec events, captured in-kernel at the moment of the exec rather than
 	// looked up afterward via /proc — by lookup time the parent may already
@@ -64,6 +68,7 @@ type Alert struct {
 	Severity Severity `json:"severity"`
 	Message  string   `json:"message"`
 	PID      uint32   `json:"pid"`
+	CgroupID uint64   `json:"cgroup_id,omitempty"`
 	Comm     string   `json:"comm"`
 	Filename string   `json:"filename,omitempty"`
 	Dst      string   `json:"dst,omitempty"`
@@ -90,6 +95,7 @@ func evalShellSpawn(e Event, r ShellSpawnRule) *Alert {
 		Severity: r.Severity,
 		Message:  fmt.Sprintf("shell %q spawned by unexpected parent %q (ppid %d)", e.Comm, e.ParentComm, e.PPID),
 		PID:      e.PID,
+		CgroupID: e.CgroupID,
 		Comm:     e.Comm,
 	}
 }
@@ -115,6 +121,7 @@ func evalSensitiveFiles(e Event, r SensitiveFilesRule) *Alert {
 		Severity: r.Severity,
 		Message:  fmt.Sprintf("%q accessed sensitive path %q", e.Comm, e.Filename),
 		PID:      e.PID,
+		CgroupID: e.CgroupID,
 		Comm:     e.Comm,
 		Filename: e.Filename,
 	}
@@ -143,6 +150,7 @@ func evalReadonlyWrites(e Event, r ReadonlyWritesRule) *Alert {
 		Severity: r.Severity,
 		Message:  fmt.Sprintf("%q wrote to protected path %q (under %q)", e.Comm, e.Filename, matched),
 		PID:      e.PID,
+		CgroupID: e.CgroupID,
 		Comm:     e.Comm,
 		Filename: e.Filename,
 	}
@@ -163,6 +171,7 @@ func evalNetworkAnomaly(e Event, r NetworkAnomalyRule) *Alert {
 		Severity: r.Severity,
 		Message:  fmt.Sprintf("%q connected to unexpected port %d (%s)", e.Comm, e.DstPort, dst),
 		PID:      e.PID,
+		CgroupID: e.CgroupID,
 		Comm:     e.Comm,
 		Dst:      dst,
 	}

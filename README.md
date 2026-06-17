@@ -156,6 +156,12 @@ and doesn't see:
   per-cgroup lineage tracking, not just comm names.
 - **`openat()` only, not legacy `open()`.** Modern glibc funnels essentially all
   opens through `openat`, so coverage is high, but it is not 100% complete.
+- **The kernel `/etc/` fast-path matches absolute paths only.** `filemon`'s
+  in-kernel filter forwards reads under `/etc/` by checking the path's leading
+  bytes, so an `openat()` with a *relative* filename against a `dirfd` already
+  pointing into `/etc` bypasses that fast-path. Such a read is still forwarded if
+  it's a write or carries a credential marker; otherwise it's dropped in-kernel.
+  A narrow gap — most tooling opens `/etc` files by absolute path.
 - **IPv4 only.** `netmon` bails out after the `AF_INET` check; IPv6 and
   `AF_UNIX` connections are not observed.
 - **No cross-monitor correlation.** A credential read followed by an outbound

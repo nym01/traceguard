@@ -4,8 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
+	"os"
+	"sync"
 	"time"
 )
 
@@ -23,9 +24,17 @@ type webhookPayload struct {
 // explosion under a burst of alerts; the channel buffer absorbs short
 // bursts, and if it's ever full we drop and log rather than blocking the
 // detection pipeline on network I/O.
-func startWebhookSender(url string, alerts <-chan Alert) {
+//
+// wg lets the caller wait for a clean drain on shutdown: the goroutine
+// signals wg.Done when its range loop exits, which happens once the alerts
+// channel is closed and fully drained. So closing the channel at shutdown
+// and waiting on wg flushes any still-queued alerts before exit rather than
+// dropping them.
+func startWebhookSender(url string, alerts <-chan Alert, wg *sync.WaitGroup) {
 	client := &http.Client{Timeout: 5 * time.Second}
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for a := range alerts {
 			payload := webhookPayload{
 				Text:  fmt.Sprintf("[%s] %s: %s", a.Severity, a.Rule, a.Message),
@@ -33,17 +42,17 @@ func startWebhookSender(url string, alerts <-chan Alert) {
 			}
 			body, err := json.Marshal(payload)
 			if err != nil {
-				log.Printf("webhook: marshal error: %v", err)
+				fmt.Fprintf(os.Stderr, "traceguard: webhook: marshal error: %v\n", err)
 				continue
 			}
 			resp, err := client.Post(url, "application/json", bytes.NewReader(body))
 			if err != nil {
-				log.Printf("webhook: post error: %v", err)
+				fmt.Fprintf(os.Stderr, "traceguard: webhook: post error: %v\n", err)
 				continue
 			}
 			resp.Body.Close()
 			if resp.StatusCode >= 300 {
-				log.Printf("webhook: unexpected status %d", resp.StatusCode)
+				fmt.Fprintf(os.Stderr, "traceguard: webhook: unexpected status %d\n", resp.StatusCode)
 			}
 		}
 	}()
@@ -59,6 +68,6 @@ func sendAlert(ch chan Alert, a Alert) {
 	select {
 	case ch <- a:
 	default:
-		log.Println("webhook: queue full, dropping alert")
+		fmt.Fprintln(os.Stderr, "traceguard: webhook: queue full, dropping alert")
 	}
 }

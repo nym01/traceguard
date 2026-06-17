@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"os/signal"
 	"sync"
@@ -78,9 +79,23 @@ func run() error {
 	// of whether a webhook is configured. The buffer absorbs short bursts; the
 	// sender drops (and logs) rather than block detection on network I/O.
 	var webhookCh chan Alert
+	var webhookWG sync.WaitGroup
 	if *webhook != "" {
+		// Validate the URL once at startup so a typo (or an unparseable
+		// value) fails loudly here rather than in a per-alert error loop
+		// forever after. Only http/https make sense for an HTTP POST.
+		u, err := url.Parse(*webhook)
+		if err != nil {
+			return fmt.Errorf("parse webhook URL %q: %w", *webhook, err)
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return fmt.Errorf("webhook URL %q must use the http or https scheme (got %q)", *webhook, u.Scheme)
+		}
+		if u.Scheme == "http" {
+			fmt.Fprintln(os.Stderr, "traceguard: warning: webhook URL uses http, not https — alert contents (file paths, process names, IPs) will be sent unencrypted")
+		}
 		webhookCh = make(chan Alert, 100)
-		startWebhookSender(*webhook, webhookCh)
+		startWebhookSender(*webhook, webhookCh, &webhookWG)
 	}
 
 	// Output writer: stdout by default, mirrored to a log file when -log-file
@@ -177,8 +192,8 @@ func run() error {
 	}()
 
 	// One reader goroutine per monitor; the WaitGroup lets us close the shared
-	// channel only once both have drained, so the printer flushes every
-	// buffered event before main() returns.
+	// channel only once all three (exec/file/network) have drained, so the
+	// printer flushes every buffered event before main() returns.
 	var wg sync.WaitGroup
 	wg.Add(3)
 	go func() {
@@ -204,6 +219,8 @@ func run() error {
 			if *verbose {
 				if b, err := json.Marshal(&ev); err == nil {
 					fmt.Fprintln(w, string(b))
+				} else {
+					fmt.Fprintf(os.Stderr, "traceguard: marshal verbose event: %v\n", err)
 				}
 			}
 			for _, a := range Evaluate(ev, ruleConfig) {
@@ -214,6 +231,7 @@ func run() error {
 					Severity:  string(a.Severity),
 					Message:   a.Message,
 					PID:       a.PID,
+					CgroupID:  a.CgroupID,
 					Comm:      a.Comm,
 					Filename:  a.Filename,
 					Dst:       a.Dst,
@@ -232,9 +250,18 @@ func run() error {
 
 	fmt.Fprintln(os.Stderr, "traceguard: monitoring process execs, file access, and network connections (Ctrl-C to stop)")
 
-	wg.Wait()  // both readers have exited
+	wg.Wait()  // all three readers (exec/file/network) have exited
 	close(out) // no more events; let the printer drain and stop
 	<-done     // printer flushed everything
+
+	// Alerts still queued in the webhook channel are flushed before exit
+	// rather than dropped: the printer (sole sender on webhookCh) is now
+	// done, so closing the channel lets the sender's range loop end after
+	// draining, and we wait for it to finish.
+	if webhookCh != nil {
+		close(webhookCh)
+		webhookWG.Wait()
+	}
 	return nil
 }
 
@@ -249,6 +276,7 @@ type alertJSON struct {
 	Severity  string `json:"severity"`
 	Message   string `json:"message"`
 	PID       uint32 `json:"pid"`
+	CgroupID  uint64 `json:"cgroup_id,omitempty"`
 	Comm      string `json:"comm"`
 	Filename  string `json:"filename,omitempty"`
 	Dst       string `json:"dst,omitempty"`
@@ -265,6 +293,10 @@ func readLoop(rd *ringbuf.Reader, out chan<- Event, decode func([]byte) (Event, 
 				return // clean shutdown
 			}
 			fmt.Fprintf(os.Stderr, "traceguard: read ring buffer: %v\n", err)
+			// Back off before retrying: if the error is persistent (not a
+			// one-off), an immediate continue would tight-loop and pin a
+			// core while flooding stderr. A short sleep degrades gracefully.
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 		ev, err := decode(record.RawSample)
@@ -286,6 +318,7 @@ func decodeExec(sample []byte) (Event, error) {
 		Type:       "exec",
 		PID:        raw.Pid,
 		PPID:       raw.Ppid,
+		CgroupID:   raw.CgroupId,
 		Comm:       goString(raw.Comm[:]),
 		ParentComm: goString(raw.ParentComm[:]),
 		Filename:   goString(raw.Filename[:]),
@@ -302,6 +335,7 @@ func decodeFile(sample []byte) (Event, error) {
 		Type:     "file_access",
 		PID:      raw.Pid,
 		Flags:    raw.Flags,
+		CgroupID: raw.CgroupId,
 		Comm:     goString(raw.Comm[:]),
 		Filename: goString(raw.Filename[:]),
 	}, nil
@@ -314,11 +348,12 @@ func decodeNet(sample []byte) (Event, error) {
 		return Event{}, fmt.Errorf("decode net sample: %w", err)
 	}
 	return Event{
-		Type:    "network",
-		PID:     raw.Pid,
-		Comm:    goString(raw.Comm[:]),
-		DstIP:   net.IP(raw.DstIp[:]).String(),
-		DstPort: uint16(raw.DstPort),
+		Type:     "network",
+		PID:      raw.Pid,
+		CgroupID: raw.CgroupId,
+		Comm:     goString(raw.Comm[:]),
+		DstIP:    net.IP(raw.DstIp[:]).String(),
+		DstPort:  raw.DstPort,
 	}, nil
 }
 

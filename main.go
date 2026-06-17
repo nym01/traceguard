@@ -16,6 +16,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"net"
 	"os"
@@ -27,48 +28,26 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
+	"gopkg.in/yaml.v3"
 )
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror -I/usr/include/x86_64-linux-gnu" -type event execmon bpf/execmon.bpf.c
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror -I/usr/include/x86_64-linux-gnu" -type event filemon bpf/filemon.bpf.c
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror -I/usr/include/x86_64-linux-gnu" -type event netmon bpf/netmon.bpf.c
 
-// execEvent is the user-facing JSON shape for one process-exec event. It is
-// decoded from the raw ring-buffer sample (via the bpf2go-generated
-// execmonEvent) and enriched with a wall-clock timestamp.
-type execEvent struct {
-	Type      string `json:"type"` // always "exec"
-	Timestamp string `json:"timestamp"`
-	PID       uint32 `json:"pid"`
-	PPID      uint32 `json:"ppid"`
-	CgroupID  uint64 `json:"cgroup_id"`
-	Comm      string `json:"comm"`
-	Filename  string `json:"filename"`
-}
-
-// fileEvent is the user-facing JSON shape for one file-access event, decoded
-// from the bpf2go-generated filemonEvent.
-type fileEvent struct {
-	Type      string `json:"type"` // always "file_access"
-	Timestamp string `json:"timestamp"`
-	PID       uint32 `json:"pid"`
-	Flags     uint32 `json:"flags"`
-	CgroupID  uint64 `json:"cgroup_id"`
-	Comm      string `json:"comm"`
-	Filename  string `json:"filename"`
-}
-
-// netEvent is the user-facing JSON shape for one outbound-connection event,
-// decoded from the bpf2go-generated netmonEvent. Dst is a human-readable
-// "a.b.c.d:port" rendering of the raw dst_ip bytes and (already host-order)
-// dst_port.
-type netEvent struct {
-	Type      string `json:"type"` // always "network"
-	Timestamp string `json:"timestamp"`
-	PID       uint32 `json:"pid"`
-	CgroupID  uint64 `json:"cgroup_id"`
-	Comm      string `json:"comm"`
-	Dst       string `json:"dst"`
+// loadRules reads and parses a YAML rule-config file into a RuleConfig. A
+// failure here is fatal at startup: with no rules there is nothing to alert
+// on, so the caller exits rather than run blind.
+func loadRules(path string) (RuleConfig, error) {
+	var cfg RuleConfig
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cfg, fmt.Errorf("read rules file %q: %w", path, err)
+	}
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return cfg, fmt.Errorf("parse rules file %q: %w", path, err)
+	}
+	return cfg, nil
 }
 
 func main() {
@@ -79,6 +58,18 @@ func main() {
 }
 
 func run() error {
+	rulesPath := flag.String("rules", "rules.yaml", "path to the YAML rule-config file")
+	verbose := flag.Bool("verbose", false, "also print the raw telemetry stream (default: alerts only)")
+	flag.Parse()
+
+	// Load and parse the rule config once, before any monitor starts. If this
+	// fails there is nothing to evaluate against, so fail fast with a clear
+	// error rather than booting the eBPF programs.
+	ruleConfig, err := loadRules(*rulesPath)
+	if err != nil {
+		return err
+	}
+
 	// eBPF maps and programs are charged against a per-process memory-lock
 	// limit on older kernels; lift it so the load doesn't fail with EPERM.
 	if err := rlimit.RemoveMemlock(); err != nil {
@@ -142,10 +133,11 @@ func run() error {
 	}
 	defer netRD.Close()
 
-	// Shared output channel: every reader marshals its event to JSON and sends
-	// the bytes here. A single printer goroutine writes them out, so two
-	// concurrent readers can't interleave a half-written line on stdout.
-	out := make(chan []byte, 64)
+	// Shared event channel: every reader decodes its raw sample into the unified
+	// Event and sends it here. A single consumer goroutine evaluates rules and
+	// writes output, so two concurrent readers can't interleave a half-written
+	// line on stdout.
+	out := make(chan Event, 64)
 
 	// Close both readers on SIGINT/SIGTERM so each blocking Read returns
 	// ringbuf.ErrClosed and its reader goroutine exits.
@@ -176,27 +168,67 @@ func run() error {
 		readLoop(netRD, out, decodeNet)
 	}()
 
-	// Printer: the sole writer to stdout.
+	// Consumer: the sole writer to stdout. With -verbose it dumps the raw event
+	// stream; in all modes it runs every event through the rule engine and
+	// prints one JSON object per alert that fires.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for b := range out {
-			fmt.Println(string(b))
+		for ev := range out {
+			if *verbose {
+				if b, err := json.Marshal(&ev); err == nil {
+					fmt.Println(string(b))
+				}
+			}
+			for _, a := range Evaluate(ev, ruleConfig) {
+				b, err := json.Marshal(alertJSON{
+					Type:      "alert",
+					Timestamp: time.Now().Format(time.RFC3339Nano),
+					Rule:      a.Rule,
+					Severity:  string(a.Severity),
+					Message:   a.Message,
+					PID:       a.PID,
+					Comm:      a.Comm,
+					Filename:  a.Filename,
+					Dst:       a.Dst,
+				})
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "traceguard: encode alert: %v\n", err)
+					continue
+				}
+				fmt.Println(string(b))
+			}
 		}
 	}()
 
 	fmt.Fprintln(os.Stderr, "traceguard: monitoring process execs, file access, and network connections (Ctrl-C to stop)")
 
-	wg.Wait()    // both readers have exited
-	close(out)   // no more events; let the printer drain and stop
-	<-done       // printer flushed everything
+	wg.Wait()  // both readers have exited
+	close(out) // no more events; let the printer drain and stop
+	<-done     // printer flushed everything
 	return nil
 }
 
+// alertJSON is the user-facing JSON shape for one fired alert. It mirrors the
+// Alert produced by the rule engine, plus a "type":"alert" discriminator and a
+// wall-clock timestamp. Empty Filename/Dst fields are omitted so an exec alert
+// doesn't carry a blank "dst" and vice versa.
+type alertJSON struct {
+	Type      string `json:"type"` // always "alert"
+	Timestamp string `json:"timestamp"`
+	Rule      string `json:"rule"`
+	Severity  string `json:"severity"`
+	Message   string `json:"message"`
+	PID       uint32 `json:"pid"`
+	Comm      string `json:"comm"`
+	Filename  string `json:"filename,omitempty"`
+	Dst       string `json:"dst,omitempty"`
+}
+
 // readLoop pulls raw samples off one ring buffer, hands each to a monitor's
-// decoder, and forwards the resulting JSON bytes to the shared channel. It
-// returns when the reader is closed (ringbuf.ErrClosed) on shutdown.
-func readLoop(rd *ringbuf.Reader, out chan<- []byte, decode func([]byte) ([]byte, error)) {
+// decoder, and forwards the resulting Event to the shared channel. It returns
+// when the reader is closed (ringbuf.ErrClosed) on shutdown.
+func readLoop(rd *ringbuf.Reader, out chan<- Event, decode func([]byte) (Event, error)) {
 	for {
 		record, err := rd.Read()
 		if err != nil {
@@ -206,78 +238,59 @@ func readLoop(rd *ringbuf.Reader, out chan<- []byte, decode func([]byte) ([]byte
 			fmt.Fprintf(os.Stderr, "traceguard: read ring buffer: %v\n", err)
 			continue
 		}
-		b, err := decode(record.RawSample)
+		ev, err := decode(record.RawSample)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "traceguard: %v\n", err)
 			continue
 		}
-		out <- b
+		out <- ev
 	}
 }
 
-// decodeExec turns a raw execmon ring-buffer sample into a marshaled execEvent.
-func decodeExec(sample []byte) ([]byte, error) {
+// decodeExec turns a raw execmon ring-buffer sample into the unified Event.
+func decodeExec(sample []byte) (Event, error) {
 	var raw execmonEvent
 	if err := binary.Read(bytes.NewReader(sample), binary.LittleEndian, &raw); err != nil {
-		return nil, fmt.Errorf("decode exec sample: %w", err)
+		return Event{}, fmt.Errorf("decode exec sample: %w", err)
 	}
-	ev := execEvent{
-		Type:      "exec",
-		Timestamp: time.Now().Format(time.RFC3339Nano),
-		PID:       raw.Pid,
-		PPID:      raw.Ppid,
-		CgroupID:  raw.CgroupId,
-		Comm:      goString(raw.Comm[:]),
-		Filename:  goString(raw.Filename[:]),
-	}
-	b, err := json.Marshal(&ev)
-	if err != nil {
-		return nil, fmt.Errorf("encode exec event: %w", err)
-	}
-	return b, nil
+	return Event{
+		Type:       "exec",
+		PID:        raw.Pid,
+		PPID:       raw.Ppid,
+		Comm:       goString(raw.Comm[:]),
+		ParentComm: goString(raw.ParentComm[:]),
+		Filename:   goString(raw.Filename[:]),
+	}, nil
 }
 
-// decodeFile turns a raw filemon ring-buffer sample into a marshaled fileEvent.
-func decodeFile(sample []byte) ([]byte, error) {
+// decodeFile turns a raw filemon ring-buffer sample into the unified Event.
+func decodeFile(sample []byte) (Event, error) {
 	var raw filemonEvent
 	if err := binary.Read(bytes.NewReader(sample), binary.LittleEndian, &raw); err != nil {
-		return nil, fmt.Errorf("decode file sample: %w", err)
+		return Event{}, fmt.Errorf("decode file sample: %w", err)
 	}
-	ev := fileEvent{
-		Type:      "file_access",
-		Timestamp: time.Now().Format(time.RFC3339Nano),
-		PID:       raw.Pid,
-		Flags:     raw.Flags,
-		CgroupID:  raw.CgroupId,
-		Comm:      goString(raw.Comm[:]),
-		Filename:  goString(raw.Filename[:]),
-	}
-	b, err := json.Marshal(&ev)
-	if err != nil {
-		return nil, fmt.Errorf("encode file event: %w", err)
-	}
-	return b, nil
+	return Event{
+		Type:     "file_access",
+		PID:      raw.Pid,
+		Flags:    raw.Flags,
+		Comm:     goString(raw.Comm[:]),
+		Filename: goString(raw.Filename[:]),
+	}, nil
 }
 
-// decodeNet turns a raw netmon ring-buffer sample into a marshaled netEvent.
-func decodeNet(sample []byte) ([]byte, error) {
+// decodeNet turns a raw netmon ring-buffer sample into the unified Event.
+func decodeNet(sample []byte) (Event, error) {
 	var raw netmonEvent
 	if err := binary.Read(bytes.NewReader(sample), binary.LittleEndian, &raw); err != nil {
-		return nil, fmt.Errorf("decode net sample: %w", err)
+		return Event{}, fmt.Errorf("decode net sample: %w", err)
 	}
-	ev := netEvent{
-		Type:      "network",
-		Timestamp: time.Now().Format(time.RFC3339Nano),
-		PID:       raw.Pid,
-		CgroupID:  raw.CgroupId,
-		Comm:      goString(raw.Comm[:]),
-		Dst:       fmt.Sprintf("%s:%d", net.IP(raw.DstIp[:]).String(), raw.DstPort),
-	}
-	b, err := json.Marshal(&ev)
-	if err != nil {
-		return nil, fmt.Errorf("encode net event: %w", err)
-	}
-	return b, nil
+	return Event{
+		Type:    "network",
+		PID:     raw.Pid,
+		Comm:    goString(raw.Comm[:]),
+		DstIP:   net.IP(raw.DstIp[:]).String(),
+		DstPort: uint16(raw.DstPort),
+	}, nil
 }
 
 // goString converts a fixed-size, NUL-terminated C char buffer into a Go

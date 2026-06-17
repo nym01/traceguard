@@ -14,12 +14,13 @@ import (
 )
 
 type execmonEvent struct {
-	_        structs.HostLayout
-	Pid      uint32
-	Ppid     uint32
-	CgroupId uint64
-	Comm     [16]uint8
-	Filename [256]uint8
+	_          structs.HostLayout
+	Pid        uint32
+	Ppid       uint32
+	CgroupId   uint64
+	Comm       [16]uint8
+	ParentComm [16]uint8
+	Filename   [256]uint8
 }
 
 // loadExecmon returns the embedded CollectionSpec for execmon.

@@ -13,6 +13,8 @@
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
+#define TASK_COMM_LEN 16
+
 // Event streamed to userspace. Keep this layout in sync with the Go side;
 // bpf2go regenerates the matching Go struct from this type's BTF.
 struct event {
@@ -20,6 +22,7 @@ struct event {
 	__u32 ppid;
 	__u64 cgroup_id;
 	__u8 comm[16];
+	__u8 parent_comm[TASK_COMM_LEN];
 	__u8 filename[256];
 };
 
@@ -31,6 +34,7 @@ struct event *unused_event __attribute__((unused));
 struct task_struct {
 	struct task_struct *real_parent;
 	__u32 tgid;
+	char comm[TASK_COMM_LEN];
 } __attribute__((preserve_access_index));
 
 // Tracepoint context for sched/sched_process_exec. Field offsets match the
@@ -65,6 +69,7 @@ int on_process_exec(struct trace_event_sched_process_exec *ctx)
 
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	e->ppid = BPF_CORE_READ(task, real_parent, tgid);
+	BPF_CORE_READ_STR_INTO(&e->parent_comm, task, real_parent, comm);
 
 	e->cgroup_id = bpf_get_current_cgroup_id();
 

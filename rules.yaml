@@ -1,0 +1,31 @@
+shell_spawn:
+  enabled: true
+  severity: high
+  shell_names: ["sh", "bash"]
+  allowed_parents: ["sh", "bash", "sshd", "systemd", "login", "su", "sudo"]
+
+sensitive_files:
+  enabled: true
+  severity: critical
+  paths:
+    - /etc/shadow
+    - /etc/gshadow
+    - /etc/sudoers
+  path_substrings:
+    - ".ssh/"
+    - "id_rsa"
+    - "id_ed25519"
+
+readonly_writes:
+  enabled: true
+  severity: high
+  protected_prefixes:
+    - /usr/
+    - /bin/
+    - /sbin/
+    - /lib/
+
+network_anomaly:
+  enabled: true
+  severity: medium
+  allowed_ports: [80, 443, 53, 22]

@@ -27,6 +27,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
@@ -181,7 +182,9 @@ func run() error {
 	out := make(chan Event, 64)
 
 	// Close both readers on SIGINT/SIGTERM so each blocking Read returns
-	// ringbuf.ErrClosed and its reader goroutine exits.
+	// ringbuf.ErrClosed and its reader goroutine exits. The same signal also
+	// closes reporterStop so the drop-counter reporter goroutine exits cleanly.
+	reporterStop := make(chan struct{})
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -189,7 +192,22 @@ func run() error {
 		execRD.Close()
 		fileRD.Close()
 		netRD.Close()
+		close(reporterStop)
 	}()
+
+	// Dropped-event counters: each monitor's BPF program bumps a per-CPU
+	// counter whenever bpf_ringbuf_reserve() fails (ring buffer full). We poll
+	// these to surface that otherwise-silent failure mode. PossibleCPU sizes
+	// the per-CPU lookup slice used by readDropped below.
+	numCPU, err := ebpf.PossibleCPU()
+	if err != nil {
+		return fmt.Errorf("query possible CPU count: %w", err)
+	}
+	dropMonitors := []dropMonitor{
+		{name: "exec", m: execObjs.DroppedEvents},
+		{name: "file", m: fileObjs.DroppedEvents},
+		{name: "network", m: netObjs.DroppedEvents},
+	}
 
 	// One reader goroutine per monitor; the WaitGroup lets us close the shared
 	// channel only once all three (exec/file/network) have drained, so the
@@ -207,6 +225,36 @@ func run() error {
 	go func() {
 		defer wg.Done()
 		readLoop(netRD, out, decodeNet)
+	}()
+
+	// Drop-counter reporter: every 30s, read each monitor's per-CPU dropped
+	// counter and, if it climbed since the last check, warn on stderr. It
+	// shares the same shutdown WaitGroup and stops on reporterStop (the same
+	// signal that closes the ring-buffer readers).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		prev := make([]uint64, len(dropMonitors))
+		for {
+			select {
+			case <-reporterStop:
+				return
+			case <-ticker.C:
+				for i, mon := range dropMonitors {
+					total, err := readDropped(mon.m, numCPU)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "traceguard: read %s dropped counter: %v\n", mon.name, err)
+						continue
+					}
+					if total > prev[i] {
+						fmt.Fprintf(os.Stderr, "traceguard: warning: dropped %d %s events in the last 30s (ring buffer full)\n", total-prev[i], mon.name)
+					}
+					prev[i] = total
+				}
+			}
+		}
 	}()
 
 	// Consumer: the sole writer to stdout. With -verbose it dumps the raw event
@@ -232,6 +280,7 @@ func run() error {
 					Message:   a.Message,
 					PID:       a.PID,
 					CgroupID:  a.CgroupID,
+					Container: a.Container,
 					Comm:      a.Comm,
 					Filename:  a.Filename,
 					Dst:       a.Dst,
@@ -250,9 +299,22 @@ func run() error {
 
 	fmt.Fprintln(os.Stderr, "traceguard: monitoring process execs, file access, and network connections (Ctrl-C to stop)")
 
-	wg.Wait()  // all three readers (exec/file/network) have exited
+	wg.Wait()  // all three readers (exec/file/network) plus the reporter have exited
 	close(out) // no more events; let the printer drain and stop
 	<-done     // printer flushed everything
+
+	// Final drop summary for the whole run, printed unconditionally. A line of
+	// zeros on a clean run is a positive "nothing was dropped" confirmation,
+	// not just silence. The maps are still open here — execObjs/fileObjs/
+	// netObjs are only Closed by the deferred calls when run() returns.
+	for _, mon := range dropMonitors {
+		total, err := readDropped(mon.m, numCPU)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "traceguard: read %s dropped counter: %v\n", mon.name, err)
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "traceguard: dropped %d %s events total this run (ring buffer full)\n", total, mon.name)
+	}
 
 	// Alerts still queued in the webhook channel are flushed before exit
 	// rather than dropped: the printer (sole sender on webhookCh) is now
@@ -277,9 +339,34 @@ type alertJSON struct {
 	Message   string `json:"message"`
 	PID       uint32 `json:"pid"`
 	CgroupID  uint64 `json:"cgroup_id,omitempty"`
+	Container string `json:"container,omitempty"`
 	Comm      string `json:"comm"`
 	Filename  string `json:"filename,omitempty"`
 	Dst       string `json:"dst,omitempty"`
+}
+
+// dropMonitor pairs a human-readable monitor name with its dropped_events map,
+// so the reporter and shutdown summary can iterate the three monitors uniformly.
+type dropMonitor struct {
+	name string
+	m    *ebpf.Map
+}
+
+// readDropped sums a monitor's per-CPU dropped-event counters into a single
+// total. dropped_events is a single-entry PERCPU_ARRAY, so cilium/ebpf wants
+// the lookup destination to be a slice with one slot per possible CPU; each
+// CPU bumped its own slot lock-free in-kernel, and we add them up here.
+func readDropped(m *ebpf.Map, numCPU int) (uint64, error) {
+	var key uint32
+	perCPU := make([]uint64, numCPU)
+	if err := m.Lookup(&key, &perCPU); err != nil {
+		return 0, err
+	}
+	var total uint64
+	for _, v := range perCPU {
+		total += v
+	}
+	return total, nil
 }
 
 // readLoop pulls raw samples off one ring buffer, hands each to a monitor's

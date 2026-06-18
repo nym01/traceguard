@@ -1,8 +1,23 @@
 package main
 
 import (
+	"os"
 	"testing"
 )
+
+// TestMain points container-name resolution at an empty temp dir for the whole
+// package, so rule tests neither walk nor depend on the real /sys/fs/cgroup.
+// With no matching inode present, resolveContainerName cleanly returns "".
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "traceguard-cgroup-test")
+	if err != nil {
+		panic(err)
+	}
+	cgroupRoot = dir
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
+}
 
 func testConfig() RuleConfig {
 	return RuleConfig{

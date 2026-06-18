@@ -69,9 +69,12 @@ type Alert struct {
 	Message  string   `json:"message"`
 	PID      uint32   `json:"pid"`
 	CgroupID uint64   `json:"cgroup_id,omitempty"`
-	Comm     string   `json:"comm"`
-	Filename string   `json:"filename,omitempty"`
-	Dst      string   `json:"dst,omitempty"`
+	// Container is the human-readable name of the container the event fired in,
+	// resolved from CgroupID. Empty (and omitted) for events on the bare host.
+	Container string `json:"container,omitempty"`
+	Comm      string `json:"comm"`
+	Filename  string `json:"filename,omitempty"`
+	Dst       string `json:"dst,omitempty"`
 }
 
 func contains(list []string, s string) bool {
@@ -91,12 +94,13 @@ func evalShellSpawn(e Event, r ShellSpawnRule) *Alert {
 		return nil
 	}
 	return &Alert{
-		Rule:     "unexpected-shell-spawn",
-		Severity: r.Severity,
-		Message:  fmt.Sprintf("shell %q spawned by unexpected parent %q (ppid %d)", e.Comm, e.ParentComm, e.PPID),
-		PID:      e.PID,
-		CgroupID: e.CgroupID,
-		Comm:     e.Comm,
+		Rule:      "unexpected-shell-spawn",
+		Severity:  r.Severity,
+		Message:   fmt.Sprintf("shell %q spawned by unexpected parent %q (ppid %d)", e.Comm, e.ParentComm, e.PPID),
+		PID:       e.PID,
+		CgroupID:  e.CgroupID,
+		Container: resolveContainerName(e.CgroupID),
+		Comm:      e.Comm,
 	}
 }
 
@@ -117,13 +121,14 @@ func evalSensitiveFiles(e Event, r SensitiveFilesRule) *Alert {
 		return nil
 	}
 	return &Alert{
-		Rule:     "sensitive-file-access",
-		Severity: r.Severity,
-		Message:  fmt.Sprintf("%q accessed sensitive path %q", e.Comm, e.Filename),
-		PID:      e.PID,
-		CgroupID: e.CgroupID,
-		Comm:     e.Comm,
-		Filename: e.Filename,
+		Rule:      "sensitive-file-access",
+		Severity:  r.Severity,
+		Message:   fmt.Sprintf("%q accessed sensitive path %q", e.Comm, e.Filename),
+		PID:       e.PID,
+		CgroupID:  e.CgroupID,
+		Container: resolveContainerName(e.CgroupID),
+		Comm:      e.Comm,
+		Filename:  e.Filename,
 	}
 }
 
@@ -146,13 +151,14 @@ func evalReadonlyWrites(e Event, r ReadonlyWritesRule) *Alert {
 		return nil
 	}
 	return &Alert{
-		Rule:     "readonly-write",
-		Severity: r.Severity,
-		Message:  fmt.Sprintf("%q wrote to protected path %q (under %q)", e.Comm, e.Filename, matched),
-		PID:      e.PID,
-		CgroupID: e.CgroupID,
-		Comm:     e.Comm,
-		Filename: e.Filename,
+		Rule:      "readonly-write",
+		Severity:  r.Severity,
+		Message:   fmt.Sprintf("%q wrote to protected path %q (under %q)", e.Comm, e.Filename, matched),
+		PID:       e.PID,
+		CgroupID:  e.CgroupID,
+		Container: resolveContainerName(e.CgroupID),
+		Comm:      e.Comm,
+		Filename:  e.Filename,
 	}
 }
 
@@ -167,13 +173,14 @@ func evalNetworkAnomaly(e Event, r NetworkAnomalyRule) *Alert {
 	}
 	dst := fmt.Sprintf("%s:%d", e.DstIP, e.DstPort)
 	return &Alert{
-		Rule:     "anomalous-outbound-connection",
-		Severity: r.Severity,
-		Message:  fmt.Sprintf("%q connected to unexpected port %d (%s)", e.Comm, e.DstPort, dst),
-		PID:      e.PID,
-		CgroupID: e.CgroupID,
-		Comm:     e.Comm,
-		Dst:      dst,
+		Rule:      "anomalous-outbound-connection",
+		Severity:  r.Severity,
+		Message:   fmt.Sprintf("%q connected to unexpected port %d (%s)", e.Comm, e.DstPort, dst),
+		PID:       e.PID,
+		CgroupID:  e.CgroupID,
+		Container: resolveContainerName(e.CgroupID),
+		Comm:      e.Comm,
+		Dst:       dst,
 	}
 }
 

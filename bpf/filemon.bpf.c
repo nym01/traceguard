@@ -63,6 +63,16 @@ struct {
 	__uint(max_entries, 256 * 1024);
 } events SEC(".maps");
 
+// Counts events dropped because bpf_ringbuf_reserve() failed (ring buffer
+// full). A PERCPU_ARRAY gives each CPU its own slot, so the increment below
+// needs no atomics; userspace sums the per-CPU values when reporting.
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} dropped_events SEC(".maps");
+
 // has_sensitive_marker scans the path for any credential marker substring at
 // an arbitrary offset (e.g. /home/u/.ssh/id_rsa, /root/.aws/credentials,
 // server.pem). Every index is masked to [0,255] so the verifier can prove the
@@ -109,8 +119,13 @@ int on_openat(struct trace_event_raw_sys_enter *ctx)
 	// into it. The BPF stack is capped at 512 bytes, so we avoid staging the
 	// 256-byte path in a separate stack buffer — we reuse this reserved space.
 	e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-	if (!e)
+	if (!e) {
+		__u32 key = 0;
+		__u64 *count = bpf_map_lookup_elem(&dropped_events, &key);
+		if (count)
+			(*count)++;
 		return 0;
+	}
 
 	const char *filename = (const char *)ctx->args[1];
 	__u32 flags = (__u32)ctx->args[2];

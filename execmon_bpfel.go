@@ -72,7 +72,8 @@ type execmonProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type execmonMapSpecs struct {
-	Events *ebpf.MapSpec `ebpf:"events"`
+	DroppedEvents *ebpf.MapSpec `ebpf:"dropped_events"`
+	Events        *ebpf.MapSpec `ebpf:"events"`
 }
 
 // execmonVariableSpecs contains global variables before they are loaded into the kernel.
@@ -102,11 +103,13 @@ func (o *execmonObjects) Close() error {
 //
 // It can be passed to loadExecmonObjects or ebpf.CollectionSpec.LoadAndAssign.
 type execmonMaps struct {
-	Events *ebpf.Map `ebpf:"events"`
+	DroppedEvents *ebpf.Map `ebpf:"dropped_events"`
+	Events        *ebpf.Map `ebpf:"events"`
 }
 
 func (m *execmonMaps) Close() error {
 	return _ExecmonClose(
+		m.DroppedEvents,
 		m.Events,
 	)
 }

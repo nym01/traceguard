@@ -61,6 +61,16 @@ struct {
 	__uint(max_entries, 256 * 1024);
 } events SEC(".maps");
 
+// Counts events dropped because bpf_ringbuf_reserve() failed (ring buffer
+// full). A PERCPU_ARRAY gives each CPU its own slot, so the increment below
+// needs no atomics; userspace sums the per-CPU values when reporting.
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} dropped_events SEC(".maps");
+
 SEC("tracepoint/syscalls/sys_enter_connect")
 int on_connect(struct trace_event_raw_sys_enter *ctx)
 {
@@ -76,8 +86,13 @@ int on_connect(struct trace_event_raw_sys_enter *ctx)
 		return 0;
 
 	struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-	if (!e)
+	if (!e) {
+		__u32 key = 0;
+		__u64 *count = bpf_map_lookup_elem(&dropped_events, &key);
+		if (count)
+			(*count)++;
 		return 0;
+	}
 
 	e->pid = bpf_get_current_pid_tgid() >> 32; // tgid (userspace PID)
 	e->cgroup_id = bpf_get_current_cgroup_id();

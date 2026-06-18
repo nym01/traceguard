@@ -73,7 +73,8 @@ type netmonProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type netmonMapSpecs struct {
-	Events *ebpf.MapSpec `ebpf:"events"`
+	DroppedEvents *ebpf.MapSpec `ebpf:"dropped_events"`
+	Events        *ebpf.MapSpec `ebpf:"events"`
 }
 
 // netmonVariableSpecs contains global variables before they are loaded into the kernel.
@@ -103,11 +104,13 @@ func (o *netmonObjects) Close() error {
 //
 // It can be passed to loadNetmonObjects or ebpf.CollectionSpec.LoadAndAssign.
 type netmonMaps struct {
-	Events *ebpf.Map `ebpf:"events"`
+	DroppedEvents *ebpf.Map `ebpf:"dropped_events"`
+	Events        *ebpf.Map `ebpf:"events"`
 }
 
 func (m *netmonMaps) Close() error {
 	return _NetmonClose(
+		m.DroppedEvents,
 		m.Events,
 	)
 }

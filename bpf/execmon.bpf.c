@@ -55,14 +55,29 @@ struct {
 	__uint(max_entries, 1 << 24); // 16 MiB
 } events SEC(".maps");
 
+// Counts events dropped because bpf_ringbuf_reserve() failed (ring buffer
+// full). A PERCPU_ARRAY gives each CPU its own slot, so the increment below
+// needs no atomics; userspace sums the per-CPU values when reporting.
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} dropped_events SEC(".maps");
+
 SEC("tracepoint/sched/sched_process_exec")
 int on_process_exec(struct trace_event_sched_process_exec *ctx)
 {
 	struct event *e;
 
 	e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-	if (!e)
+	if (!e) {
+		__u32 key = 0;
+		__u64 *count = bpf_map_lookup_elem(&dropped_events, &key);
+		if (count)
+			(*count)++;
 		return 0;
+	}
 
 	__u64 id = bpf_get_current_pid_tgid();
 	e->pid = id >> 32; // tgid (userspace PID)
